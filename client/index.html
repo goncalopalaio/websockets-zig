@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <title>Websocket Client</title>
+</head>
+<body>
+  <script>
+      window.addEventListener('load', function() {
+        var content = document.getElementById("content");
+
+        var socketAddress = "ws://localhost:9995";
+        var exampleSocket = new WebSocket(socketAddress);
+
+        log("connecting to: " + socketAddress);
+
+        exampleSocket.onopen = function (event) {
+            var message = "Can you hear me?";
+            exampleSocket.send(message);
+            log("send: " + message);
+
+        };
+        exampleSocket.onmessage = function (event) {
+            console.log(event.data);
+            log("received:" + event + " " + event.data);
+        }
+        
+        function log(text) {
+            var li = document.createElement("li");
+            li.appendChild(document.createTextNode(text));
+
+            content.appendChild(li);   
+        }
+      });
+    
+  </script>
+
+  <ul id="content"></ul>
+</body>
+</html>
