@@ -1,3 +1,9 @@
+# Zig
+
+zig-cache/
+
+# C
+
 # Prerequisites
 *.d
 
