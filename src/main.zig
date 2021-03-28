@@ -200,7 +200,7 @@ pub fn main() anyerror!void {
     _ = args.skip();
 
     var raw_port = try args.next(allocator) orelse return error.NoPortGiven catch {
-        info("Couldport number.", .{});
+        info("Please provide a port number as an argument.", .{});
         return;
     };
 
