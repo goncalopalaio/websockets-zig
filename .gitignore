@@ -1,5 +1,7 @@
-# Zig
+# OSX
+.DS_Store
 
+# Zig
 zig-cache/
 
 # C
