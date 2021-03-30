@@ -18,11 +18,15 @@ var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const BASE64_ENCODED_KEY_LEN = base64.Base64Encoder.calcSize(Sha1.digest_length);
 
 const RECORD_BYTES_TO_FILE = false;
-const RECORDING_FILE = "test-files/small-payload.txt";
+const RECORDING_FILE = "test-files/tmp-payload.txt";
 
 // basic-tcp-chat.zig https://gist.github.com/andrewrk/34c21bdc1600b0884a3ab9fa9aa485b8
 // https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API/Writing_WebSocket_servers
 // https://www.honeybadger.io/blog/building-a-simple-websockets-server-from-scratch-in-ruby/
+
+const Operation = enum { continuation_frame, text_frame, binary_frame, connection_close, ping, pong, unsupported };
+// reserved_non_control_frame,
+// reserved_control_frame,
 
 const Room = struct {
     clients: std.AutoHashMap(*Client, void),
@@ -50,12 +54,17 @@ const Client = struct {
         var payload_data = ArrayList(u8).init(allocator);
         defer payload_data.deinit(); // TODO one buffer arraylist is enough?
 
+        var output = ArrayList(u8).init(allocator);
+        defer output.deinit();
+
         var writer = self.connection.stream.writer();
         var reader = self.connection.stream.reader();
 
         var handshake_done = false;
         while (true) {
             info("Reading...", .{});
+
+            // TODO This is blocking when a second client connects, why?
 
             if (!handshake_done) {
                 handshake_done = performHandshake(allocator, reader, writer, &handshake_data) catch {
@@ -66,12 +75,7 @@ const Client = struct {
                 continue;
             }
 
-            const has_new_payload = try readPayload(allocator, reader, writer, &payload_data);
-            if (has_new_payload) {
-                const payload = payload_data.items;
-                info("Payload: {s}", .{payload});
-                continue;
-            }
+            _ = try readPayload(allocator, reader, writer, &payload_data, &output);
 
             // room.broadcast(payload, self); // TODO send a correct frame to the other clients.
         }
@@ -80,26 +84,46 @@ const Client = struct {
     }
 };
 
-fn readPayload(allocator: anytype, reader: anytype, writer: anytype, buffer: *ArrayList(u8)) !bool {
+fn readPayload(allocator: anytype, reader: anytype, writer: anytype, buffer: *ArrayList(u8), output: *ArrayList(u8)) !bool {
     var first_byte = try readByte(reader);
 
     const fin = first_byte & 0b10000000;
     const opcode = first_byte & 0b00001111;
 
-    info("Fin: {} opcode: {}", .{ fin, opcode });
+    warn("Fin: {} opcode: {}", .{ fin, opcode });
 
     if (fin == 0) {
-        return error.UnsupportedContinuations; // TODO support continuations.
+        // TODO support continuations?
+        warn("Continuations are currently unsupported but this isn't the final fragment.", .{});
     }
-    if (opcode != 1) {
-        return error.UnsupportedOpcode; // TODO support other opcodes different than 1.
+
+    var operation = switch (opcode) {
+        0x0 => Operation.continuation_frame,
+        0x1 => Operation.text_frame,
+        0x2 => Operation.binary_frame,
+        0x8 => Operation.connection_close,
+        0x9 => Operation.ping,
+        0xA => Operation.pong,
+        else => Operation.unsupported,
+    };
+
+    warn("Operation:{}", .{operation});
+
+    // TODO Implement other opcodes.
+    if (operation == Operation.continuation_frame) return error.UnsupportedOpcode;
+    if (operation == Operation.binary_frame) return error.UnsupportedOpcode;
+    if (operation == Operation.connection_close) return error.UnsupportedOpcode;
+    if (operation == Operation.connection_close) return error.UnsupportedOpcode;
+
+    if (operation == Operation.unsupported) {
+        return false; // TODO close connection.
     }
 
     var second_byte = try readByte(reader);
     const is_masked = second_byte & 0b10000000;
     const payload_len = second_byte & 0b01111111;
 
-    info("Masked:{} payload_len:{}", .{ is_masked, payload_len });
+    warn("Masked:{} payload_len:{}", .{ is_masked, payload_len });
 
     if (is_masked == 0) {
         warn("IncomingFramesMustBeMasked", .{});
@@ -120,7 +144,7 @@ fn readPayload(allocator: anytype, reader: anytype, writer: anytype, buffer: *Ar
         return error.MaskReadFail;
     }
 
-    info("Mask: {} | {} | {} | {}", .{ mask[0], mask[1], mask[2], mask[3] });
+    warn("Mask: {} | {} | {} | {}", .{ mask[0], mask[1], mask[2], mask[3] });
 
     // Read the payload.
     buffer.shrinkRetainingCapacity(0);
@@ -131,7 +155,42 @@ fn readPayload(allocator: anytype, reader: anytype, writer: anytype, buffer: *Ar
         try buffer.append(unmasked);
     }
 
+    const payload = buffer.items;
+    info("Payload: {s}", .{payload});
+
+    if (operation == Operation.text_frame) {
+        try fillFrame(output, payload);
+        writer.writeAll(output.items) catch |e| {
+            warn("Failed to write frame: {s}", .{e});
+        };
+    }
+
     return true;
+}
+
+fn fillFrame(buffer: *ArrayList(u8), echo: []u8) !void {
+    const fin = 0b10000000;
+    const opcode = 0x1;
+
+    // fin and opcode
+    var a: u8 = fin | opcode;
+
+    // masked and payload length
+    var b: u8 = 0;
+    b = @truncate(u8, echo.len); // TODO Remove - this is for debug purposes only, the payload shouldn't be larger than 127.
+
+    const frame_header = [_]u8{ a, b };
+
+    buffer.shrinkRetainingCapacity(0);
+    try buffer.appendSlice(frame_header[0..]);
+    try buffer.appendSlice(echo[0..]);
+
+    info("Frame:", .{});
+    var tmp: [64]u8 = undefined;
+    for (buffer.items) |item| {
+        const result = try std.fmt.bufPrint(&tmp, "{b}", .{item});
+        info("\t{s: >8}", .{result});
+    }
 }
 
 fn performHandshake(allocator: anytype, reader: anytype, writer: anytype, buffer: *ArrayList(u8)) !bool {
