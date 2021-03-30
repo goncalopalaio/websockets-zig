@@ -337,9 +337,10 @@ test "start of large payload" {
     var buffer = ArrayList(u8).init(test_allocator);
     defer buffer.deinit();
 
-   const handshake_done = try performHandshake(test_allocator, reader, writer, &buffer);
+    const handshake_done = try performHandshake(test_allocator, reader, writer, &buffer);
     expect(handshake_done);
- 
+
+    // TODO Support large payloads
     // const has_new_payload = try readPayload(test_allocator, reader, writer, &buffer);
     // expect(has_new_payload);
 }
