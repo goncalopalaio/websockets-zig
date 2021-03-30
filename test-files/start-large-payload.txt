@@ -1,0 +1,8 @@
+GET / HTTP/1.1
+Host: 127.0.0.1:9994
+Connection: Upgrade
+Upgrade: websocket
+Sec-WebSocket-Version: 13
+Sec-WebSocket-Key: KaKX6Dt5c/Dv7lSCtaEaWw==
+
+Å˛

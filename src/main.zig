@@ -7,12 +7,18 @@ const Sha1 = std.crypto.hash.Sha1;
 const base64 = std.base64;
 const ArrayList = std.ArrayList;
 
+const expect = std.testing.expect;
+const test_allocator = std.testing.allocator;
+
 const MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const SEC_WEBSOCKET_KEY = "Sec-WebSocket-Key: ";
 const HANDSHAKE_RESPONSE_FMT = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n";
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-const base64_encoded_key_len = base64.Base64Encoder.calcSize(Sha1.digest_length);
+const BASE64_ENCODED_KEY_LEN = base64.Base64Encoder.calcSize(Sha1.digest_length);
+
+const RECORD_BYTES_TO_FILE = false;
+const RECORDING_FILE = "test-files/small-payload.txt";
 
 // basic-tcp-chat.zig https://gist.github.com/andrewrk/34c21bdc1600b0884a3ab9fa9aa485b8
 // https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API/Writing_WebSocket_servers
@@ -42,7 +48,7 @@ const Client = struct {
         defer handshake_data.deinit();
 
         var payload_data = ArrayList(u8).init(allocator);
-        defer payload_data.deinit();
+        defer payload_data.deinit(); // TODO one buffer arraylist is enough?
 
         var writer = self.connection.stream.writer();
         var reader = self.connection.stream.reader();
@@ -52,51 +58,20 @@ const Client = struct {
             info("Reading...", .{});
 
             if (!handshake_done) {
-                handshake_done = handshakeIncoming(allocator, reader, writer, &handshake_data) catch {
+                handshake_done = performHandshake(allocator, reader, writer, &handshake_data) catch {
                     self.connection.stream.close();
                     break;
                 };
                 info("Handshake done: {}", .{handshake_done});
+                continue;
             }
 
-            var first_byte = try reader.readByte();
-            const fin = first_byte & 0b10000000;
-            const opcode = first_byte & 0b00001111;
-
-            info("Fin: {} opcode: {}", .{ fin, opcode });
-
-            if (fin == 0) return error.UnsupportedContinuations; // TODO support continuations.
-            if (opcode != 1) return error.UnsupportedOpcode; // TODO support other opcodes different than 1.
-
-            var second_byte = try reader.readByte();
-            const is_masked = second_byte & 0b10000000;
-            const payload_len = second_byte & 0b01111111;
-
-            if (is_masked == 0) return error.IncomingFramesMustBeMasked;
-            if (payload_len >= 126) return error.UnsupportedLength; // TODO Support pay loads larger than 126 bytes.
-
-            info("Masked:{} payload_len:{}", .{ is_masked, payload_len });
-
-            // Since we're only expecting payload lengths < 126 we'll skip extended payload length,
-            // extended payload length continued and go straight to the masking key which has 4 bytes.
-
-            var mask: [4]u8 = undefined;
-            const amt = try reader.read(&mask);
-            if (amt != 4) return error.MaskReadFail;
-
-            info("Mask: {} | {} | {} | {}", .{ mask[0], mask[1], mask[2], mask[3] });
-
-            // Read the payload.
-            payload_data.shrinkRetainingCapacity(0);
-            var idx: u8 = 0;
-            while (idx < payload_len) : (idx += 1) {
-                var a = try reader.readByte();
-                var unmasked = a ^ mask[idx % 4];
-                try payload_data.append(unmasked);
+            const has_new_payload = try readPayload(allocator, reader, writer, &payload_data);
+            if (has_new_payload) {
+                const payload = payload_data.items;
+                info("Payload: {s}", .{payload});
+                continue;
             }
-
-            const payload = payload_data.items;
-            info("Payload: {s}", .{payload});
 
             // room.broadcast(payload, self); // TODO send a correct frame to the other clients.
         }
@@ -105,9 +80,63 @@ const Client = struct {
     }
 };
 
-fn handshakeIncoming(allocator: anytype, reader: anytype, writer: anytype, list: *ArrayList(u8)) !bool {
-    try readRequestInto(reader, list);
-    const value = try parseSecWebSocketKey(list);
+fn readPayload(allocator: anytype, reader: anytype, writer: anytype, buffer: *ArrayList(u8)) !bool {
+    var first_byte = try readByte(reader);
+
+    const fin = first_byte & 0b10000000;
+    const opcode = first_byte & 0b00001111;
+
+    info("Fin: {} opcode: {}", .{ fin, opcode });
+
+    if (fin == 0) {
+        return error.UnsupportedContinuations; // TODO support continuations.
+    }
+    if (opcode != 1) {
+        return error.UnsupportedOpcode; // TODO support other opcodes different than 1.
+    }
+
+    var second_byte = try readByte(reader);
+    const is_masked = second_byte & 0b10000000;
+    const payload_len = second_byte & 0b01111111;
+
+    info("Masked:{} payload_len:{}", .{ is_masked, payload_len });
+
+    if (is_masked == 0) {
+        warn("IncomingFramesMustBeMasked", .{});
+        return error.IncomingFramesMustBeMasked;
+    }
+    if (payload_len >= 126) {
+        warn("UnsupportedLength", .{});
+        return error.UnsupportedLength; // TODO Support pay loads larger than 126 bytes.
+    }
+
+    // Since we're only expecting payload lengths < 126 we'll skip extended payload length,
+    // extended payload length continued and go straight to the masking key which has 4 bytes.
+
+    var mask: [4]u8 = undefined;
+    const amt = try readIntoBytes(reader, &mask);
+    if (amt != 4) {
+        warn("MaskReadFail", .{});
+        return error.MaskReadFail;
+    }
+
+    info("Mask: {} | {} | {} | {}", .{ mask[0], mask[1], mask[2], mask[3] });
+
+    // Read the payload.
+    buffer.shrinkRetainingCapacity(0);
+    var idx: u8 = 0;
+    while (idx < payload_len) : (idx += 1) {
+        var a = try readByte(reader);
+        var unmasked = a ^ mask[idx % 4];
+        try buffer.append(unmasked);
+    }
+
+    return true;
+}
+
+fn performHandshake(allocator: anytype, reader: anytype, writer: anytype, buffer: *ArrayList(u8)) !bool {
+    try readRequestInto(reader, buffer);
+    const value = try parseSecWebSocketKey(buffer);
 
     if (value.len != 0) {
         info("Got:{s} {s}", .{ SEC_WEBSOCKET_KEY, value });
@@ -139,7 +168,7 @@ fn createSecWebSocketAccept(key: []const u8) [28]u8 {
     var hashed_key: [Sha1.digest_length]u8 = undefined;
     hash.final(&hashed_key);
 
-    var encoded: [base64_encoded_key_len]u8 = undefined;
+    var encoded: [BASE64_ENCODED_KEY_LEN]u8 = undefined;
     _ = base64.standard_encoder.encode(&encoded, &hashed_key);
 
     return encoded;
@@ -165,7 +194,7 @@ fn readRequestInto(reader: anytype, list: *std.ArrayList(u8)) !void {
     const max_size: usize = 1000;
     var prev_byte: u8 = 0;
     while (true) {
-        var byte: u8 = try reader.readByte();
+        var byte: u8 = try readByte(reader);
 
         if (list.items.len == max_size) {
             list.shrinkRetainingCapacity(0);
@@ -235,4 +264,82 @@ pub fn main() anyerror!void {
 
     // TODO close connections
     info("Bye.", .{});
+}
+
+fn readByte(reader: anytype) !u8 {
+    const byte = try reader.readByte();
+
+    if (RECORD_BYTES_TO_FILE) {
+        appendByteToTestFile(byte) catch |x| {
+            warn("readByte: Error appending to test file", .{});
+        };
+    }
+
+    return byte;
+}
+
+fn readIntoBytes(reader: anytype, buffer: []u8) !usize {
+    const amount = try reader.read(buffer);
+
+    if (RECORD_BYTES_TO_FILE) {
+        appendBytesToTestFile(buffer) catch |x| {
+            warn("read: Error appending to test file", .{});
+        };
+    }
+
+    return amount;
+}
+
+fn appendBytesToTestFile(bytes: []const u8) !void {
+    const file = try std.fs.cwd().openFile(RECORDING_FILE, .{ .write = true });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try file.writeAll(bytes);
+}
+
+fn appendByteToTestFile(byte: u8) !void {
+    const file = try std.fs.cwd().openFile(RECORDING_FILE, .{ .write = true });
+    defer file.close();
+    try file.seekFromEnd(0);
+    const bytes = [_]u8{byte};
+    try file.writeAll(bytes[0..]);
+}
+
+test "reading small payloads" {
+    const in = try std.fs.cwd().openFile("test-files/small-payload.txt", .{ .read = true });
+    defer in.close();
+    const out = try std.fs.cwd().openFile("tmp/output.txt", .{ .write = true });
+    defer out.close();
+
+    const reader = in.reader();
+    const writer = out.writer();
+
+    var buffer = ArrayList(u8).init(test_allocator);
+    defer buffer.deinit();
+
+    const handshake_done = try performHandshake(test_allocator, reader, writer, &buffer);
+    expect(handshake_done);
+    const has_new_payload = try readPayload(test_allocator, reader, writer, &buffer);
+    expect(has_new_payload);
+    expect(std.mem.eql(u8, buffer.items, "Hello!\n"));
+}
+
+test "start of large payload" {
+    // TODO reduce boilerplate required to read the file
+    const in = try std.fs.cwd().openFile("test-files/start-large-payload.txt", .{ .read = true });
+    defer in.close();
+    const out = try std.fs.cwd().openFile("tmp/output.txt", .{ .write = true });
+    defer out.close();
+
+    const reader = in.reader();
+    const writer = out.writer();
+
+    var buffer = ArrayList(u8).init(test_allocator);
+    defer buffer.deinit();
+
+   const handshake_done = try performHandshake(test_allocator, reader, writer, &buffer);
+    expect(handshake_done);
+ 
+    // const has_new_payload = try readPayload(test_allocator, reader, writer, &buffer);
+    // expect(has_new_payload);
 }
