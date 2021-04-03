@@ -64,7 +64,8 @@ const Client = struct {
         while (true) {
             info("Reading...", .{});
 
-            // TODO This is blocking when a second client connects, why?
+            // TODO This is blocking when a second client connects, why? 
+            // - Happening because the thread is being blocked by read. To have this work correctly we'll need async behavior for sockets, for example with select.
 
             if (!handshake_done) {
                 handshake_done = performHandshake(allocator, reader, writer, &handshake_data) catch {
